@@ -10,14 +10,11 @@ import os
 import random
 
 # -------------------- USER SETTINGS --------------------
-nx, ny = 58, 58
+nx, ny = 60, 60
 nt = 9
 deformation_type = "fault"
 output_dir = "insar_localized_refined"
 os.makedirs(output_dir, exist_ok=True)
-
-np.random.seed(42)
-random.seed(42)
 
 # -------------------- NOISE COMPONENTS --------------------
 dem_error = gaussian_filter(np.random.randn(nx, ny), sigma=10) * 0.4
@@ -25,7 +22,6 @@ dem_error = gaussian_filter(np.random.randn(nx, ny), sigma=10) * 0.4
 x = np.linspace(-1, 1, nx)
 y = np.linspace(-1, 1, ny)
 xx, yy = np.meshgrid(x, y)
-orbital_base = 0.2 * xx + 0.15 * yy
 
 # -------------------- LOCALIZED FAULT MODEL --------------------
 def localized_fault(x, y, xc, yc, fault_angle, fault_length, slip, width, taper_distance):
@@ -89,7 +85,7 @@ ground_truth_amp = np.zeros((nx, ny))
 ground_truth_mask = np.zeros((nx, ny))
 
 # Generate multiple fault parameters (4-6 faults to match the pattern)
-n_faults = random.randint(1, 3)
+n_faults = random.randint(2, 5)
 fault_params = []
 # All faults share the same orientation
 common_angle = np.random.uniform(0, 180)
@@ -108,7 +104,8 @@ for i in range(n_faults):
 for t in range(nt):
     # Smooth correlated atmospheric noise
     atm = gaussian_filter(np.random.randn(nx, ny), sigma=8) * 0.8
-    orbital = orbital_base * (1 + 0.1 * np.random.randn())
+    # Generate random orbital trend for each frame
+    orbital = gaussian_filter(np.random.randn(nx, ny), sigma=15) * 0.6
     decor = np.random.randn(nx, ny) * 0.05
     total = atm + dem_error + orbital + decor
 
@@ -153,7 +150,7 @@ for t in range(nt):
     frames.append(total)
 
     # --- Save noisy frame ---
-    plt.figure(figsize=(4, 4))
+    plt.figure(figsize=(14, 14))
     plt.imshow(total, cmap="RdBu", origin="lower", vmin=-2, vmax=2)
     plt.colorbar(label="Phase (radians)")
     plt.title(f"Frame {t+1} ({'with deformation' if 1 <= t <= 7 else 'noise only'})")
@@ -170,7 +167,7 @@ frames = np.stack(frames, axis=0)
 np.save(os.path.join(output_dir, "insar_with_refined_localized_deformation.npy"), frames)
 
 # Save amplitude ground truth
-plt.figure(figsize=(4, 4))
+plt.figure(figsize=(14, 14))
 plt.imshow(ground_truth_amp, cmap="RdBu", origin="lower")
 plt.colorbar(label="Phase (radians)")
 plt.title("Ground Truth Deformation (cumulative)")
@@ -180,7 +177,7 @@ plt.close()
 np.save(os.path.join(output_dir, "ground_truth_amplitude.npy"), ground_truth_amp)
 
 # Save binary mask
-plt.figure(figsize=(4, 4))
+plt.figure(figsize=(14, 14))
 plt.imshow(ground_truth_mask, cmap="gray", origin="lower")
 plt.colorbar(label="Mask (1 = deformation region)")
 plt.title("Ground Truth Binary Mask")
