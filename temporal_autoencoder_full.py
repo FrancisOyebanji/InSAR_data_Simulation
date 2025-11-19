@@ -1,18 +1,23 @@
 # temporal_conv_autoencoder_full.py
 # TensorBoard removed and replaced with CSV logging for HPC compatibility.
 
-import os
-import math
-from typing import Optional, Callable, Tuple, List
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt
+# Import standard libraries
+import os  # For file and directory operations
+import math  # For mathematical operations
+from typing import Optional, Callable, Tuple, List  # For type hints
+import numpy as np  # For numerical computations
+import torch  # PyTorch deep learning framework
+import torch.nn as nn  # Neural network modules
+import torch.nn.functional as F  # Functional API for neural networks
+from torch.utils.data import Dataset, DataLoader  # Dataset and batch loading utilities
+import matplotlib.pyplot as plt  # For visualization and plotting
 
+# Import custom InSAR dataset
+from insar_dataset import create_dataloader  # DataLoader factory for InSAR data
+
+# Set output directory for results
 OUT_DIR = "/mnt/data/temporal_ae_outputs"
-os.makedirs(OUT_DIR, exist_ok=True)
+os.makedirs(OUT_DIR, exist_ok=True)  # Create directory if it doesn't exist
 
 # ------------------------------
 # Simple CSV Logger (HPC Safe)
@@ -40,21 +45,31 @@ class TemporalConvAutoencoder(nn.Module):
         in_channels: int = 1,
         dem_channels: int = 1,
         num_filters: int = 64,
-        encoder_layers: int = 6,
+        encoder_layers: int = 7,  # Changed from 6 to 7 layers
         decoder_layers: int = 4,
         time_kernel: int = 2,
         negative_slope: float = 0.2,
         use_adaptive_pool: bool = True,
     ):
         super().__init__()
-        assert encoder_layers == 6 and decoder_layers == 4
+        assert encoder_layers == 7 and decoder_layers == 4  # Updated assertion
         self.in_channels = in_channels
         self.dem_channels = dem_channels
         self.num_filters = num_filters
         self.time_kernel = time_kernel
         self.use_adaptive_pool = use_adaptive_pool
 
+        # Build 7 encoder layers with specific pooling schedule:
+        # Layers 1-4: (B, 64, 9, H, W) - no pooling
+        # Layer 5: (B, 64, 3, H, W) - pool 9→3
+        # Layer 6: (B, 64, 3, H, W) - no pooling
+        # Layer 7: (B, 64, 1, H, W) - pool 3→1
         self.encoder_convs = nn.ModuleList()
+        self.pool_after = [False, False, False, False, True, False, True]  # Pool after layers 5 and 7
+        self.pool_kernels = [(1, 1, 1)] * encoder_layers
+        self.pool_kernels[4] = (3, 1, 1)  # Layer 5: pool 9->3
+        self.pool_kernels[6] = (3, 1, 1)  # Layer 7: pool 3->1
+        
         current_in = in_channels
         for i in range(encoder_layers):
             conv = nn.Conv3d(
@@ -87,12 +102,16 @@ class TemporalConvAutoencoder(nn.Module):
             raise ValueError("x must be 5D tensor (B,C,T,H,W)")
         b, c, t, h, w = x.shape
         feats = x
-        for conv3 in self.encoder_convs:
+        
+        # Apply encoder layers with selective temporal pooling
+        for i, conv3 in enumerate(self.encoder_convs):
             feats = conv3(feats)
             feats = self.enc_act(feats)
-            if self.use_adaptive_pool and feats.shape[2] > 1:
-                feats = F.max_pool3d(feats, kernel_size=(2, 1, 1))
+            # Apply pooling after layers 5 and 7 only (when pool_after[i] is True)
+            if self.pool_after[i] and feats.shape[2] > 1:
+                feats = F.max_pool3d(feats, kernel_size=self.pool_kernels[i])
 
+        # Ensure temporal dimension is reduced to 1
         if feats.shape[2] != 1:
             if self.use_adaptive_pool:
                 feats = F.adaptive_avg_pool3d(feats, output_size=(1, h, w))
@@ -117,97 +136,10 @@ class TemporalConvAutoencoder(nn.Module):
 
 
 # ------------------------------
-# Synthetic Spatial Patterns
-# ------------------------------
-def synth_unipolar(shape: Tuple[int,int], amplitude=1.0, center=None, sigma=5.0):
-    H, W = shape
-    y = np.arange(H)[:, None]
-    x = np.arange(W)[None, :]
-    cy = H/2 if center is None else center[0]
-    cx = W/2 if center is None else center[1]
-    gauss = amplitude * np.exp(-((x-cx)**2 + (y-cy)**2) / (2*sigma*sigma))
-    return gauss.astype(np.float32)
-
-def synth_dipole(shape, amplitude=1.0, separation=10, sigma=3.0):
-    H, W = shape
-    p1 = synth_unipolar(shape, amplitude=amplitude, center=(H//2, W//2 - separation//2), sigma=sigma)
-    p2 = synth_unipolar(shape, amplitude=-amplitude, center=(H//2, W//2 + separation//2), sigma=sigma)
-    return (p1 + p2).astype(np.float32)
+# Real InSAR Data Processing
 
 
-# ------------------------------
-# Flexible Dataset
-# ------------------------------
-class SpatioTemporalDatasetFlexible(Dataset):
-    def __init__(
-        self,
-        sequences=None,
-        dems=None,
-        synth=True,
-        n_samples=100,
-        frame_shape=(1,8,64,64),
-        dem_channels=1,
-        noise_std=0.02,
-        deformation_type="sum",
-        dipole_params=None
-    ):
-        self.synth = synth
-        self.sequences = sequences
-        self.dems = dems
-        self.n = n_samples if synth else (len(sequences) if sequences is not None else 0)
-        self.C, self.T, self.H, self.W = frame_shape
-        self.dem_ch = dem_channels
-        self.noise_std = noise_std
-        self.deformation_type = deformation_type
-        self.dipole_params = dipole_params or {"amplitude": 0.5, "separation": 8, "sigma": 3.0}
-
-    def __len__(self):
-        return self.n
-
-    def __getitem__(self, idx):
-        if self.synth:
-            seq = np.random.randn(self.C, self.T, self.H, self.W).astype(np.float32) * 0.05
-            t = np.arange(self.T).astype(np.float32)
-            temporal_profile = np.sin(2*np.pi*(t / max(1,self.T))) * 0.1
-            for ti in range(self.T):
-                seq[0,ti] += temporal_profile[ti]
-
-            if self.deformation_type == "sum":
-                base = synth_unipolar((self.H,self.W), amplitude=0.1, sigma=8.0)
-                for ti in range(self.T):
-                    seq[0,ti] += base * (ti/self.T)
-                target = seq.sum(axis=1, keepdims=True)
-
-            elif self.deformation_type == "unipolar":
-                pat = synth_unipolar((self.H,self.W), amplitude=self.dipole_params["amplitude"],
-                                     sigma=self.dipole_params["sigma"])
-                for ti in range(self.T):
-                    seq[0,ti] += pat * ((ti+1)/self.T)
-                target = pat[np.newaxis,:,:]
-
-            elif self.deformation_type == "dipole":
-                pat = synth_dipole((self.H,self.W),
-                                   amplitude=self.dipole_params["amplitude"],
-                                   separation=self.dipole_params["separation"],
-                                   sigma=self.dipole_params["sigma"])
-                for ti in range(self.T):
-                    seq[0,ti] += pat * ((ti+1)/self.T)
-                target = pat[np.newaxis,:,:]
-
-            dem = np.random.randn(self.dem_ch, self.H, self.W).astype(np.float32) * 0.05
-
-        else:
-            seq = self.sequences[idx].astype(np.float32)
-            dem = self.dems[idx].astype(np.float32)
-            target = seq.sum(axis=1, keepdims=True)
-
-        noisy = seq + np.random.randn(*seq.shape).astype(np.float32) * self.noise_std
-        return torch.from_numpy(noisy), torch.from_numpy(dem), torch.from_numpy(target)
-
-
-# ------------------------------
-# Visualization
-# ------------------------------
+# Visualization utility for displaying model predictions vs ground truth
 def visualize_sample(noisy_seq, dem, target, pred, out_prefix):
     noisy = noisy_seq.detach().cpu().numpy()
     demn = dem.detach().cpu().numpy()
@@ -229,43 +161,64 @@ def visualize_sample(noisy_seq, dem, target, pred, out_prefix):
     plt.close(fig)
 
 
-# ------------------------------
-# Helper functions
-# ------------------------------
+# Helper functions for model utilities
 def count_parameters(model):
+    # Count total trainable parameters in the model
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 def save_checkpoint(model, optimizer, epoch, path):
+    # Save model state and optimizer state for resuming training
     state = {"model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(), "epoch": epoch}
     torch.save(state, path)
 
 
-# ------------------------------
+def load_insar_data(data_dir="insar_localized_refined", batch_size=1):
+    """
+    Load real InSAR data from the insar_localized_refined folder using DataLoader.
+    
+    Args:
+        data_dir (str): Path to the directory containing generated InSAR data
+        batch_size (int): Batch size for DataLoader
+    
+    Returns:
+        DataLoader: PyTorch DataLoader with InSAR data
+    """
+    frames_path = os.path.join(data_dir, "insar_with_refined_localized_deformation.npy")
+    dem_path = os.path.join(data_dir, "ground_truth_dem.npy")
+    target_path = os.path.join(data_dir, "ground_truth_amplitude.npy")
+    mask_path = os.path.join(data_dir, "ground_truth_mask.npy")
+    
+    # Create and return DataLoader
+    return create_dataloader(
+        frames_path=frames_path,
+        dem_path=dem_path,
+        target_path=target_path,
+        mask_path=mask_path,
+        batch_size=batch_size,
+        shuffle=False
+    )
+
+
 # Training / Validation with CSV Logging
 # ------------------------------
 def train_and_validate_demo(
     device,
     n_epochs=1,
-    batch_size=8,
-    synth_deformation="sum",
+    batch_size=1,
     use_adaptive_pool=True,
+    data_dir="insar_localized_refined",
 ):
     model = TemporalConvAutoencoder(in_channels=1, dem_channels=1, num_filters=64,
+                                    encoder_layers=7, decoder_layers=4,
                                     use_adaptive_pool=use_adaptive_pool)
     model = model.to(device)
     print("Model created. Trainable params:", count_parameters(model))
 
-    train_ds = SpatioTemporalDatasetFlexible(synth=True, n_samples=80,
-                                             frame_shape=(1,8,64,64),
-                                             dem_channels=1, noise_std=0.02,
-                                             deformation_type=synth_deformation)
-    val_ds = SpatioTemporalDatasetFlexible(synth=True, n_samples=20,
-                                           frame_shape=(1,8,64,64),
-                                           dem_channels=1, noise_std=0.02,
-                                           deformation_type=synth_deformation)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size)
+    # Load real InSAR data
+    print(f"Loading real InSAR data from '{data_dir}'...")
+    train_loader = load_insar_data(data_dir=data_dir, batch_size=batch_size)
+    # For real data, use the same loader for validation
+    val_loader = load_insar_data(data_dir=data_dir, batch_size=batch_size)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     mse = nn.MSELoss()
@@ -278,7 +231,13 @@ def train_and_validate_demo(
         # ---- Train ----
         model.train()
         running = 0.0
-        for noisy_seq, dem, target in train_loader:
+        for batch in train_loader:
+            # Handle both synthetic (3 outputs) and real data (4 outputs with mask)
+            if len(batch) == 4:
+                noisy_seq, dem, target, mask = batch
+            else:
+                noisy_seq, dem, target = batch
+            
             noisy_seq, dem, target = noisy_seq.to(device), dem.to(device), target.to(device)
             pred = model(noisy_seq, dem)
             loss = mse(pred, target)
@@ -295,7 +254,13 @@ def train_and_validate_demo(
         model.eval()
         running_val = 0.0
         with torch.no_grad():
-            for noisy_seq, dem, target in val_loader:
+            for batch in val_loader:
+                # Handle both synthetic (3 outputs) and real data (4 outputs with mask)
+                if len(batch) == 4:
+                    noisy_seq, dem, target, mask = batch
+                else:
+                    noisy_seq, dem, target = batch
+                
                 noisy_seq, dem, target = noisy_seq.to(device), dem.to(device), target.to(device)
                 pred = model(noisy_seq, dem)
                 loss = mse(pred, target)
@@ -315,28 +280,22 @@ def train_and_validate_demo(
             best_val = val_loss
             save_checkpoint(model, optimizer, epoch, os.path.join(OUT_DIR, "best_checkpoint.pt"))
 
-        # visualization
-        sample_noisy, sample_dem, sample_targ = val_ds[0]
-        pred_sample = model(sample_noisy.unsqueeze(0).to(device),
-                            sample_dem.unsqueeze(0).to(device))
-        visualize_sample(sample_noisy, sample_dem, sample_targ,
-                         pred_sample.cpu()[0],
-                         os.path.join(OUT_DIR, f"epoch{epoch}"))
-
     writer.close()
     print("Training complete. Outputs written to", OUT_DIR)
     return model
 
 
-# ------------------------------
-# Main
-# ------------------------------
+# Entry point - Run the model training demo
 if __name__ == "__main__":
+    # Select device (GPU if available, otherwise CPU)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Train with real InSAR data from insar_localized_refined folder
     model = train_and_validate_demo(
-        device=device,
-        n_epochs=1,
-        batch_size=8,
-        synth_deformation="dipole",
-        use_adaptive_pool=True
+        device=device,  # Use selected device
+        n_epochs=10,  # Train for 10 epochs
+        batch_size=1,  # Batch size 1 for single time series
+        use_adaptive_pool=True,  # Use adaptive pooling for better compression
+        data_dir="insar_localized_refined"  # Path to generated InSAR data
     )
